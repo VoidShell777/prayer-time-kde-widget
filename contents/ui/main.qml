@@ -4,6 +4,7 @@ import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.components as PlasmaComponents3
 import org.kde.kirigami as Kirigami
+import org.kde.notification
 
 PlasmoidItem {
     id: root
@@ -17,14 +18,24 @@ PlasmoidItem {
     property string nextPrayerTime: ""
     property int secondsUntilNext: 0
     property bool notificationShown: false
+    property bool locationFetched: false
     
     property string apiService: Plasmoid.configuration.apiService || "aladhan"
-    property string city: Plasmoid.configuration.city || "London"
-    property string country: Plasmoid.configuration.country || "UK"
-    property double latitude: Plasmoid.configuration.latitude || 51.5074
-    property double longitude: Plasmoid.configuration.longitude || -0.1278
-    property int calculationMethod: Plasmoid.configuration.calculationMethod || 2
+    property string city: Plasmoid.configuration.city || ""
+    property string country: Plasmoid.configuration.country || ""
+    property double latitude: Plasmoid.configuration.latitude || 0
+    property double longitude: Plasmoid.configuration.longitude || 0
+    property int calculationMethod: Plasmoid.configuration.calculationMethod || 3
     property int notificationMinutes: Plasmoid.configuration.notificationMinutes || 15
+    property bool useArabic: Plasmoid.configuration.useArabic || false
+    
+    property var arabicPrayerNames: {
+        "Fajr": "الفجر",
+        "Dhuhr": "الظهر",
+        "Asr": "العصر",
+        "Maghrib": "المغرب",
+        "Isha": "العشاء"
+    }
     
     Timer {
         id: updateTimer
@@ -39,31 +50,87 @@ PlasmoidItem {
     
     Timer {
         id: fetchTimer
-        interval: 60000 // check every 1 minute if need to fetch new times
+        interval: 3600000 // check every 1 heur
         running: true
         repeat: true
-        onTriggered: fetchPrayerTimes()
+        onTriggered: checkAndFetchPrayerTimes()
     }
     
     Component.onCompleted: {
-        fetchPrayerTimes()
+        // Try to auto get location if not set
+        if (latitude === 0 && longitude === 0) {
+            fetchLocation()
+        } else {
+            fetchPrayerTimes()
+        }
+    }
+    
+    function fetchLocation() {
+        var xhr = new XMLHttpRequest()
+        xhr.open("GET", "https://ipapi.co/json/")
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState === XMLHttpRequest.DONE) {
+                if (xhr.status === 200) {
+                    var response = JSON.parse(xhr.responseText)
+                    if (response.latitude && response.longitude) {
+                        latitude = response.latitude
+                        longitude = response.longitude
+                        city = response.city || ""
+                        country = response.country_name || ""
+                        
+                        // Save to config
+                        Plasmoid.configuration.latitude = latitude
+                        Plasmoid.configuration.longitude = longitude
+                        Plasmoid.configuration.city = city
+                        Plasmoid.configuration.country = country
+                        
+                        locationFetched = true
+                        fetchPrayerTimes()
+                    }
+                }
+            }
+        }
+        xhr.send()
+    }
+    
+    function checkAndFetchPrayerTimes() {
+        var now = new Date()
+        var lastFetchDate = new Date(Plasmoid.configuration.lastFetchDate || 0)
+        
+        // fetching if its a new day 
+        if (now.getDate() !== lastFetchDate.getDate() || 
+            now.getMonth() !== lastFetchDate.getMonth() ||
+            now.getFullYear() !== lastFetchDate.getFullYear()) {
+            fetchPrayerTimes()
+        }
     }
     
     function fetchPrayerTimes() {
+        if (latitude === 0 && longitude === 0) {
+            console.log("Location not set, cannot fetch prayer times")
+            return
+        }
+        
         if (apiService === "aladhan") {
             fetchFromAladhan()
         } else {
             fetchFromSalahHour()
         }
+        
+        // save fetch date (checkpoint)
+        Plasmoid.configuration.lastFetchDate = new Date().toString()
     }
     
     function fetchFromAladhan() {
         var xhr = new XMLHttpRequest()
         var date = new Date()
-        var dateStr = date.getDate() + "-" + (date.getMonth() + 1) + "-" + date.getFullYear()
+        var timestamp = Math.floor(date.getTime() / 1000)
         
-        var url = "http://api.aladhan.com/v1/timingsByCity?city=" + city + 
-                  "&country=" + country + "&method=" + calculationMethod
+        // uuse coordinates for more precised times
+        var url = "http://api.aladhan.com/v1/timings/" + timestamp + 
+                  "?latitude=" + latitude + 
+                  "&longitude=" + longitude + 
+                  "&method=" + calculationMethod
         
         xhr.open("GET", url)
         xhr.onreadystatechange = function() {
@@ -73,6 +140,8 @@ PlasmoidItem {
                     if (response.data && response.data.timings) {
                         parsePrayerTimes(response.data.timings)
                     }
+                } else {
+                    console.log("Failed to fetch prayer times from Al-Adhan")
                 }
             }
         }
@@ -87,7 +156,9 @@ PlasmoidItem {
                       String(date.getDate()).padStart(2, '0')
         
         var url = "https://api.salahhour.com/v1/prayer-times?lat=" + latitude + 
-                  "&lng=" + longitude + "&date=" + dateStr + "&method=" + calculationMethod
+                  "&lng=" + longitude + 
+                  "&date=" + dateStr + 
+                  "&method=" + calculationMethod
         
         xhr.open("GET", url)
         xhr.onreadystatechange = function() {
@@ -97,6 +168,8 @@ PlasmoidItem {
                     if (response.timings) {
                         parsePrayerTimes(response.timings)
                     }
+                } else {
+                    console.log("Failed to fetch prayer times from Salah Hour")
                 }
             }
         }
@@ -104,15 +177,23 @@ PlasmoidItem {
     }
     
     function parsePrayerTimes(timings) {
+        // extract time only (remove timezone and other info)
         prayerTimes = {
-            "Fajr": timings.Fajr,
-            "Dhuhr": timings.Dhuhr,
-            "Asr": timings.Asr,
-            "Maghrib": timings.Maghrib,
-            "Isha": timings.Isha
+            "Fajr": extractTime(timings.Fajr),
+            "Dhuhr": extractTime(timings.Dhuhr),
+            "Asr": extractTime(timings.Asr),
+            "Maghrib": extractTime(timings.Maghrib),
+            "Isha": extractTime(timings.Isha)
         }
         
         findNextPrayer()
+    }
+    
+    function extractTime(timeString) {
+        // extract HH:MM from formats like "04:45 (EST)" or "04:45"
+        if (!timeString) return "00:00"
+        var match = timeString.match(/(\d{2}:\d{2})/)
+        return match ? match[1] : timeString.substring(0, 5)
     }
     
     function findNextPrayer() {
@@ -137,13 +218,10 @@ PlasmoidItem {
             }
         }
         
-        // if no prayers left today, fetch tomorrow times
-        nextPrayer = "Fajr (Tomorrow)"
+        // if no prayers left today, next is Fajr tomorrow
+        nextPrayer = "Fajr"
         nextPrayerTime = prayerTimes.Fajr || "00:00"
-        
-        var tomorrow = new Date()
-        tomorrow.setDate(tomorrow.getDate() + 1)
-        fetchPrayerTimes()
+        updateCountdown()
     }
     
     function updateCountdown() {
@@ -155,8 +233,9 @@ PlasmoidItem {
         prayerTime.setHours(parseInt(parts[0]))
         prayerTime.setMinutes(parseInt(parts[1]))
         prayerTime.setSeconds(0)
+        prayerTime.setMilliseconds(0)
         
-        if (nextPrayer.includes("Tomorrow")) {
+        if (prayerTime <= now) {
             prayerTime.setDate(prayerTime.getDate() + 1)
         }
         
@@ -175,9 +254,22 @@ PlasmoidItem {
         
         if (minutesUntil <= notificationMinutes && minutesUntil > 0 && !notificationShown) {
             notificationShown = true
-            // in a reel implementation, trigger kde notifcation
-            console.log("Prayer time approaching: " + nextPrayer + " in " + minutesUntil + " minutes")
+            showNotification(nextPrayer, minutesUntil)
         }
+        
+        // reeset notification flag when prayer time passes
+        if (minutesUntil === 0) {
+            notificationShown = false
+        }
+    }
+    
+    function showNotification(prayer, minutes) {
+        var prayerName = useArabic ? arabicPrayerNames[prayer] : prayer
+        var message = useArabic ? 
+            "حان وقت صلاة " + prayerName + " بعد " + minutes + " دقيقة" :
+            prayer + " prayer in " + minutes + " minute" + (minutes > 1 ? "s" : "")
+        
+        console.log("Prayer notification: " + message)
     }
     
     function formatCountdown(seconds) {
@@ -190,5 +282,9 @@ PlasmoidItem {
         } else {
             return minutes + "m " + secs + "s"
         }
+    }
+    
+    function getPrayerName(prayer) {
+        return useArabic ? arabicPrayerNames[prayer] : prayer
     }
 }
